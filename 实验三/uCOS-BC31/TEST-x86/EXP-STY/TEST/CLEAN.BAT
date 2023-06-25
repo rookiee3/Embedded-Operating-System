@@ -1,0 +1,22 @@
+DEL *.EXE
+DEL *.MAP
+DEL *.OBJ
+
+CD  ../OBJ
+DEL *.EXE
+DEL *.MAP
+DEL *.OBJ
+
+CD  ../WORK
+DEL *.H
+DEL *.C
+DEL *.ASM
+DEL *.LNK
+
+CD ..
+RD OBJ
+RD LST
+RD WORK
+CD TEST
+
+
