@@ -1,0 +1,267 @@
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/uaccess.h>
+#include <linux/ioctl.h>
+#include <linux/string.h>
+#include <linux/slab.h>
+#include <linux/bio.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
+
+#define DEVICE_NAME "encryption_device"
+#define MAX_BUFFER_SIZE 4096
+
+// 定义设备驱动的命令
+#define ENCRYPTION_SET_KEY _IOW('E', 1, unsigned long)
+#define ENCRYPTION_SET_MODE _IOW('E', 2, unsigned long)
+#define ENCRYPTION_START_WRITE _IO('E', 3)
+#define ENCRYPTION_START_READ _IO('E', 4)
+#define ENCRYPTION_RESET _IO('E', 5)
+
+static char *buffer;  // 内部缓冲区指针
+static unsigned long buffer_size = 0;  // 内部缓冲区大小
+static unsigned long key = 0;  // 加密密钥
+static int mode = 0;  // 模式：0表示加密，1表示解密
+
+// 编码函数：将二进制数据编码为Base64
+static char *base64_encode(const unsigned char *input, size_t input_len) {
+    struct bio *bmem, *b64;
+    struct bio *bio_out;
+    char *output;
+    size_t output_len;
+
+    bmem = bio_alloc(GFP_KERNEL, input_len);
+    b64 = bio_alloc(GFP_KERNEL, input_len);
+
+    bio_out = bio_alloc(GFP_KERNEL, input_len);
+
+    bio_set_next(bmem, b64);
+    bio_set_next(b64, bio_out);
+
+    bmem->bi_iter.bi_sector = 0;
+    b64->bi_iter.bi_sector = 0;
+    bio_out->bi_iter.bi_sector = 0;
+
+    bio_write(bmem, input, input_len);
+    bio_flush(bmem);
+
+    bio_get(b64);
+    b64->bi_next = NULL;
+    bio_put(b64);
+
+    bio_get(bio_out);
+    bio_out->bi_next = NULL;
+    bio_put(bio_out);
+
+    output_len = bio_out->bi_iter.bi_size;
+    output = kmalloc(output_len, GFP_KERNEL);
+    if (!output) {
+        return NULL;
+    }
+
+    bio_read(bio_out, output, output_len);
+    bio_put(b64);
+    bio_put(bio_out);
+    bio_put(bmem);
+
+    return output;
+}
+
+// 解码函数：将Base64编码解码为二进制数据
+static unsigned char *base64_decode(const char *input, size_t *output_len) {
+    struct bio *b64, *bmem;
+    struct bio *bio_out;
+    unsigned char *output;
+    size_t input_len = strlen(input);
+
+    b64 = bio_alloc(GFP_KERNEL, input_len);
+    bmem = bio_alloc(GFP_KERNEL, input_len);
+
+    bio_out = bio_alloc(GFP_KERNEL, input_len);
+
+    bio_set_next(b64, bmem);
+    bio_set_next(bmem, bio_out);
+
+    b64->bi_iter.bi_sector = 0;
+    bmem->bi_iter.bi_sector = 0;
+    bio_out->bi_iter.bi_sector = 0;
+
+    bio_write(b64, input, input_len);
+    bio_flush(b64);
+
+    bio_get(bmem);
+    bmem->bi_next = NULL;
+    bio_put(bmem);
+
+    bio_get(bio_out);
+    bio_out->bi_next = NULL;
+    bio_put(bio_out);
+
+    *output_len = bio_out->bi_iter.bi_size;
+    output = kmalloc(*output_len, GFP_KERNEL);
+    if (!output) {
+        return NULL;
+    }
+
+    bio_read(bio_out, output, *output_len);
+    bio_put(b64);
+    bio_put(bio_out);
+    bio_put(bmem);
+
+    return output;
+}
+
+// 加密函数
+static void encrypt_data(char *data, size_t size) {
+    size_t i;
+    for (i = 0; i < size; i++) {
+        data[i] = (data[i] + key) % 256;
+    }
+}
+
+// 解密函数
+static void decrypt_data(char *data, size_t size) {
+    size_t i;
+    for (i = 0; i < size; i++) {
+        data[i] = (data[i] - key + 256) % 256;
+    }
+}
+
+// 设备驱动的 ioctl 函数
+static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    switch (cmd) {
+        case ENCRYPTION_SET_KEY:
+            key = arg;
+            break;
+        case ENCRYPTION_SET_MODE:
+            mode = arg;
+            break;
+        case ENCRYPTION_START_WRITE:
+            // 为内部缓冲区分配内存
+            if (buffer_size != 0) {
+                kfree(buffer);
+            }
+            buffer = kmalloc(MAX_BUFFER_SIZE, GFP_KERNEL);
+            if (!buffer) {
+                return -ENOMEM;
+            }
+            buffer_size = MAX_BUFFER_SIZE;
+            break;
+        case ENCRYPTION_START_READ:
+            if (mode == 0) {
+                // 编码为Base64
+                char *encoded_data = base64_encode((const unsigned char *)buffer, buffer_size);
+                if (encoded_data) {
+                    strcpy(buffer, encoded_data);
+                    kfree(encoded_data);
+                }
+            } else {
+                // 解码为二进制数据
+                size_t decoded_len;
+                unsigned char *decoded_data = base64_decode(buffer, &decoded_len);
+                if (decoded_data) {
+                    memcpy(buffer, decoded_data, decoded_len);
+                    kfree(decoded_data);
+                }
+            }
+            if (mode == 0) {
+                encrypt_data(buffer, buffer_size);
+            } else {
+                decrypt_data(buffer, buffer_size);
+            }
+            break;
+        case ENCRYPTION_RESET:
+            // 清空缓冲区
+            if (buffer_size != 0) {
+                kfree(buffer);
+                buffer = NULL;
+                buffer_size = 0;
+            }
+            break;
+        default:
+            return -ENOTTY;  // 不支持的命令
+    }
+    return 0;
+}
+
+// 设备驱动的 read 函数
+static ssize_t device_read(struct file *file, char __user *buf, size_t count, loff_t *offset) {
+    if (count > buffer_size) {
+        count = buffer_size;
+    }
+    if (copy_to_user(buf, buffer, count)) {
+        return -EFAULT;
+    }
+    return count;
+}
+
+// 设备驱动的 write 函数
+static ssize_t device_write(struct file *file, const char __user *buf, size_t count, loff_t *offset) {
+    if (count > buffer_size) {
+        count = buffer_size;
+    }
+    if (copy_from_user(buffer, buf, count)) {
+        return -EFAULT;
+    }
+    return count;
+}
+
+static struct file_operations fops = {
+    .owner = THIS_MODULE,
+    .unlocked_ioctl = device_ioctl,
+    .read = device_read,
+    .write = device_write,
+};
+
+static int __init encryption_device_init(void) {
+    // 分配设备号
+    if (alloc_chrdev_region(&device_number, 0, 1, DEVICE_NAME) < 0) {
+        return -1;
+    }
+
+    // 创建设备类别
+    device_class = class_create(THIS_MODULE, DEVICE_NAME);
+    if (IS_ERR(device_class)) {
+        unregister_chrdev_region(device_number, 1);
+        return PTR_ERR(device_class);
+    }
+
+    // 创建设备节点
+    if (device_create(device_class, NULL, device_number, NULL, DEVICE_NAME) == NULL) {
+        class_destroy(device_class);
+        unregister_chrdev_region(device_number, 1);
+        return -1;
+    }
+
+    // 初始化字符设备
+    cdev_init(&cdev, &fops);
+    if (cdev_add(&cdev, device_number, 1) == -1) {
+        device_destroy(device_class, device_number);
+        class_destroy(device_class);
+        unregister_chrdev_region(device_number, 1);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void __exit encryption_device_exit(void) {
+    // 清理资源
+    cdev_del(&cdev);
+    device_destroy(device_class, device_number);
+    class_destroy(device_class);
+    unregister_chrdev_region(device_number, 1);
+    if (buffer_size != 0) {
+        kfree(buffer);
+    }
+}
+
+module_init(encryption_device_init);
+module_exit(encryption_device_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("anruizhe");
+MODULE_DESCRIPTION("Character device driver for encryption");

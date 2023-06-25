@@ -1,0 +1,168 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <string.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+
+#define DEVICE_PATH "/dev/encryption_device"
+
+#define ENCRYPTION_SET_KEY _IOW('E', 1, unsigned long)
+#define ENCRYPTION_SET_MODE _IOW('E', 2, unsigned long)
+#define ENCRYPTION_START_WRITE _IO('E', 3)
+#define ENCRYPTION_START_READ _IO('E', 4)
+#define ENCRYPTION_RESET _IO('E', 5)
+
+void encrypt_data(char *data, size_t size, unsigned long key) {
+    // Apply Caesar cipher
+    for (size_t i = 0; i < size; i++) {
+        data[i] = (data[i] + key) % 256;
+    }
+
+    // Base64 encode
+    BIO *bio, *b64;
+    BUF_MEM *bptr;
+    bio = BIO_new(BIO_s_mem());
+    b64 = BIO_new(BIO_f_base64());
+    bio = BIO_push(b64, bio);
+    BIO_write(bio, data, size);
+    BIO_flush(bio);
+    BIO_get_mem_ptr(bio, &bptr);
+    memcpy(data, bptr->data, bptr->length);
+    data[bptr->length] = '\0';
+    BIO_free_all(bio);
+}
+
+void decrypt_data(char *data, size_t size, unsigned long key) {
+    // Base64 decode
+    BIO *bio, *b64;
+    size_t data_len = strlen(data);
+    bio = BIO_new_mem_buf(data, data_len);
+    b64 = BIO_new(BIO_f_base64());
+    bio = BIO_push(b64, bio);
+    size_t decoded_size = BIO_read(bio, data, data_len);
+    BIO_free_all(bio);
+
+    // Apply Caesar cipher
+    for (size_t i = 0; i < decoded_size; i++) {
+        data[i] = (data[i] - key + 256) % 256;
+    }
+}
+
+int main() {
+    int fd;
+    unsigned long key = 7;  // Example key
+    unsigned long mode = 0;  // Example mode (0 for encryption)
+
+    // Open the device file
+    fd = open(DEVICE_PATH, O_RDWR);
+    if (fd == -1) {
+        perror("Failed to open the device file");
+        return -1;
+    }
+
+    // Set the encryption key
+    if (ioctl(fd, ENCRYPTION_SET_KEY, &key) == -1) {
+        perror("Failed to set encryption key");
+        close(fd);
+        return -1;
+    }
+
+    // Set the encryption mode
+    if (ioctl(fd, ENCRYPTION_SET_MODE, &mode) == -1) {
+        perror("Failed to set encryption mode");
+        close(fd);
+        return -1;
+    }
+
+    // Small data encryption and decryption test
+    printf("Small data encryption and decryption test:\n");
+    if (ioctl(fd, ENCRYPTION_START_WRITE) == -1) {
+        perror("Failed to start write");
+        close(fd);
+        return -1;
+    }
+
+    char original_data[500] = "Hello, encryption device!";
+    char encrypted_data[500];
+    char decrypted_data[500];
+
+    memcpy(encrypted_data, original_data, sizeof(original_data));
+    encrypt_data(encrypted_data, sizeof(encrypted_data), key);
+
+    if (ioctl(fd, ENCRYPTION_START_READ) == -1) {
+        perror("Failed to start read");
+        close(fd);
+        return -1;
+    }
+
+    memcpy(decrypted_data, encrypted_data, sizeof(encrypted_data));
+    decrypt_data(decrypted_data, sizeof(decrypted_data), key);
+
+    if (memcmp(original_data, decrypted_data, sizeof(original_data)) == 0) {
+        printf("Encryption and decryption of small data successful!\n");
+    } else {
+        printf("Encryption and decryption of small data failed!\n");
+    }
+
+    // Large data encryption and decryption test
+    printf("\nLarge data encryption and decryption test:\n");
+    size_t buffer_size = 1024 * 1024;
+    char *original_large_data = malloc(buffer_size);
+    char *encrypted_large_data = malloc(buffer_size);
+    char *decrypted_large_data = malloc(buffer_size);
+
+    // Generate random data
+    srand(12345);
+    for (size_t i = 0; i < buffer_size; i++) {
+        original_large_data[i] = rand() % 256;
+    }
+
+    ssize_t bytes_written = write(fd, original_large_data, buffer_size);
+    if (bytes_written == -1) {
+        perror("Failed to write large data");
+        close(fd);
+        free(original_large_data);
+        free(encrypted_large_data);
+        free(decrypted_large_data);
+        return -1;
+    }
+
+    if (ioctl(fd, ENCRYPTION_START_READ) == -1) {
+        perror("Failed to start read");
+        close(fd);
+        free(original_large_data);
+        free(encrypted_large_data);
+        free(decrypted_large_data);
+        return -1;
+    }
+
+    ssize_t bytes_read = read(fd, encrypted_large_data, buffer_size);
+    if (bytes_read == -1) {
+        perror("Failed to read large data");
+        close(fd);
+        free(original_large_data);
+        free(encrypted_large_data);
+        free(decrypted_large_data);
+        return -1;
+    }
+
+    memcpy(decrypted_large_data, encrypted_large_data, buffer_size);
+    decrypt_data(decrypted_large_data, buffer_size, key);
+
+    if (memcmp(original_large_data, decrypted_large_data, buffer_size) == 0) {
+        printf("Encryption and decryption of large data successful!\n");
+    } else {
+        printf("Encryption and decryption of large data failed!\n");
+    }
+
+    // Cleanup
+    close(fd);
+    free(original_large_data);
+    free(encrypted_large_data);
+    free(decrypted_large_data);
+
+    return 0;
+}
